@@ -1,4 +1,4 @@
-# agent-sandbox
+# sandbox
 
 Rootless-podman sandbox for agentic coding tools. Run `claude`, `opencode`, or
 `crush` with **no route to the internet** except through a domain-allowlist
