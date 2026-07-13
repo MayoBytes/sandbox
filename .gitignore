@@ -1,0 +1,2 @@
+# Generated on every ./sandbox --build from proxy/allowlist.d/*.txt
+proxy/allowlist.generated.txt
