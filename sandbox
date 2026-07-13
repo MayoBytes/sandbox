@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+#
+# sandbox — run any agentic coding tool in a rootless podman container with no
+#           route to the internet except through a domain-allowlist proxy.
+#
+#   ./sandbox claude              # sandbox $PWD, run claude
+#   ./sandbox opencode ~/code/x   # sandbox a specific project
+#   ./sandbox crush ~/code/x
+#   ./sandbox shell ~/code/x      # bash, no agent — for poking at the boundary
+#
+#   ./sandbox --build             # (re)build images
+#   ./sandbox --logs              # tail proxy log: every request, every denial
+#   ./sandbox --down              # tear down proxy + networks
+#   ./sandbox --agents            # list available profiles
+#
+# Adding an agent = drop a file in agents/ and (optionally) a file in
+# proxy/allowlist.d/. Nothing below this line is agent-specific.
+#
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE="agent-sandbox:latest"
+PROXY_IMAGE="agent-sandbox-proxy:latest"
+INTERNAL_NET="agent-internal"   # --internal: NO egress. This is the boundary.
+EGRESS_NET="agent-egress"
+PROXY_NAME="agent-proxy"
+STATE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/agent-sandbox"
+
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mwarn:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- allowlist --
+# Squid takes one dstdomain file, so concatenate allowlist.d/*.txt into it.
+# Skips 99-* (docs). The union applies to all agents: adding an agent widens
+# the allowlist for every agent. Accept that, or run a proxy per agent.
+render_allowlist() {
+  local out="$HERE/proxy/allowlist.generated.txt"
+  {
+    echo "# GENERATED from proxy/allowlist.d/ — do not edit."
+    for f in "$HERE"/proxy/allowlist.d/*.txt; do
+      [[ "$(basename "$f")" == 99-* ]] && continue
+      printf '\n# --- %s ---\n' "$(basename "$f")"
+      cat "$f"
+    done
+  } > "$out"
+  local n
+  n=$(grep -cvE '^\s*(#|$)' "$out" || true)
+  log "allowlist: $n domains"
+}
+
+# ----------------------------------------------------------------- profiles --
+list_agents() {
+  for f in "$HERE"/agents/*.sh; do
+    printf '  %s\n' "$(basename "$f" .sh)"
+  done
+}
+
+load_agent() {
+  local name="$1" f="$HERE/agents/$1.sh"
+  [[ -f "$f" ]] || { echo "unknown agent: $name" >&2; echo "available:" >&2; list_agents >&2; exit 1; }
+  AGENT_CMD=(); AGENT_STATE_DIRS=(); AGENT_STATE_FILES=(); AGENT_ENV=()
+  unset -f agent_seed_project 2>/dev/null || true
+  # shellcheck source=/dev/null
+  source "$f"
+  [[ ${#AGENT_CMD[@]} -gt 0 ]] || die "$name.sh defines no AGENT_CMD"
+}
+
+# ------------------------------------------------------------------ podman ---
+build() {
+  render_allowlist
+  log "building $PROXY_IMAGE"
+  podman build -t "$PROXY_IMAGE" "$HERE/proxy"
+  log "building $IMAGE"
+  podman build -t "$IMAGE" "$HERE"
+}
+
+ensure_networks() {
+  # --internal = no gateway, no NAT, no way out. Everything else is decoration.
+  podman network exists "$INTERNAL_NET" \
+    || { log "creating internal (no-egress) network"; podman network create --internal "$INTERNAL_NET" >/dev/null; }
+  podman network exists "$EGRESS_NET" \
+    || { log "creating egress network"; podman network create "$EGRESS_NET" >/dev/null; }
+}
+
+ensure_proxy() {
+  render_allowlist
+  if podman container exists "$PROXY_NAME"; then
+    podman start "$PROXY_NAME" >/dev/null 2>&1 || true
+    # allowlist is bind-mounted; HUP makes squid reread it without a restart
+    podman kill -s HUP "$PROXY_NAME" >/dev/null 2>&1 || true
+  else
+    podman image exists "$PROXY_IMAGE" || die "run './sandbox --build' first"
+
+    log "starting $PROXY_NAME"
+    podman run -d --name "$PROXY_NAME" \
+      --network "$EGRESS_NET" \
+      --security-opt no-new-privileges \
+      --cap-drop ALL --cap-add SETUID --cap-add SETGID \
+      -v "$HERE/proxy/squid.conf:/etc/squid/squid.conf:ro,Z" \
+      -v "$HERE/proxy/allowlist.generated.txt:/etc/squid/allowlist.txt:ro,Z" \
+      "$PROXY_IMAGE" >/dev/null
+    sleep 1
+  fi
+
+  # Dual-home it: reachable from the internal net, but it holds the only route
+  # out. Must run whether the proxy was just created OR already existed — a
+  # leftover proxy attached to egress only would otherwise never get wired to
+  # the internal net, and agents on it can't even resolve "agent-proxy". Connect
+  # is not idempotent (it errors if already attached), so guard on membership.
+  if ! podman inspect -f '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}} {{end}}' \
+        "$PROXY_NAME" | grep -qw "$INTERNAL_NET"; then
+    log "connecting $PROXY_NAME to $INTERNAL_NET"
+    podman network connect "$INTERNAL_NET" "$PROXY_NAME"
+  fi
+}
+
+# -------------------------------------------------------------------- run ----
+run_agent() {
+  local agent="$1" project="$2"
+  [[ -d "$project" ]] || die "not a directory: $project"
+  project="$(realpath "$project")"
+
+  # Human-readable basename + a hash of the FULL realpath. The basename alone
+  # collides (~/code/foo and ~/work/foo both -> "foo"), which would silently
+  # share auth tokens and sessions between two unrelated projects — the exact
+  # thing the per-project split is supposed to prevent. The hash disambiguates.
+  local slug base hash
+  base="$(basename "$project" | tr -cd '[:alnum:]._-')"
+  hash="$(printf '%s' "$project" | sha256sum | head -c 12)"
+  slug="${base:-project}-$hash"
+
+  # State is per (agent, project). Two agents don't share sessions or tokens,
+  # and one project's compromised agent state can't touch another's.
+  AGENT_STATE_ROOT="$STATE_ROOT/$agent/$slug"
+  export AGENT_STATE_ROOT
+  mkdir -p "$AGENT_STATE_ROOT"
+
+  local mounts=()
+  for d in "${AGENT_STATE_DIRS[@]:-}"; do
+    [[ -z "$d" ]] && continue
+    mkdir -p "$AGENT_STATE_ROOT/$d"
+    mounts+=(-v "$AGENT_STATE_ROOT/$d:/home/agent/$d:Z")
+  done
+  for f in "${AGENT_STATE_FILES[@]:-}"; do
+    [[ -z "$f" ]] && continue
+    mkdir -p "$(dirname "$AGENT_STATE_ROOT/$f")"
+    [[ -f "$AGENT_STATE_ROOT/$f" ]] || echo '{}' > "$AGENT_STATE_ROOT/$f"
+    mounts+=(-v "$AGENT_STATE_ROOT/$f:/home/agent/$f:Z")
+  done
+
+  local envs=()
+  for e in "${AGENT_ENV[@]:-}"; do
+    [[ -z "$e" ]] && continue
+    envs+=(-e "$e")
+  done
+
+  # Protect the two execution-bearing paths in .git. Objects, refs, and index
+  # stay writable so the agent can still commit — but it cannot drop a pre-push
+  # hook or set core.sshCommand / a diff.*.textconv driver, any of which would
+  # otherwise run on the HOST when you later review or push. .git/config is the
+  # linchpin: read-only config means a committed .gitattributes has no driver to
+  # invoke. Still review/push from a fresh clone — see README "The credential rule".
+  local git_guard=()
+  if [[ -d "$project/.git" ]]; then
+    [[ -e "$project/.git/hooks" ]]  && git_guard+=(-v "$project/.git/hooks:/work/.git/hooks:ro,Z")
+    [[ -f "$project/.git/config" ]] && git_guard+=(-v "$project/.git/config:/work/.git/config:ro,Z")
+  fi
+
+  if declare -F agent_seed_project >/dev/null; then
+    agent_seed_project "$project"
+  fi
+
+  log "agent:   $agent"
+  log "project: $project"
+  log "network: $INTERNAL_NET (egress only via $PROXY_NAME)"
+
+  exec podman run --rm -it \
+    --name "sbx-$agent-$slug-$$" \
+    --hostname sandbox \
+    --network "$INTERNAL_NET" \
+    --userns keep-id:uid=1000,gid=1000 \
+    --security-opt no-new-privileges \
+    --cap-drop ALL \
+    --pids-limit 2048 \
+    --memory 8g \
+    -e "HTTP_PROXY=http://${PROXY_NAME}:3128" \
+    -e "HTTPS_PROXY=http://${PROXY_NAME}:3128" \
+    -e "http_proxy=http://${PROXY_NAME}:3128" \
+    -e "https_proxy=http://${PROXY_NAME}:3128" \
+    -e "NO_PROXY=localhost,127.0.0.1" \
+    -e "GIT_AUTHOR_NAME=$agent (sandboxed)" \
+    -e "GIT_AUTHOR_EMAIL=$agent@sandbox.local" \
+    -e "GIT_COMMITTER_NAME=$agent (sandboxed)" \
+    -e "GIT_COMMITTER_EMAIL=$agent@sandbox.local" \
+    "${envs[@]}" \
+    "${mounts[@]}" \
+    -v "$project:/work:Z" \
+    "${git_guard[@]}" \
+    -w /work \
+    "$IMAGE" "${AGENT_CMD[@]}"
+}
+
+down() {
+  podman rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
+  podman network rm -f "$INTERNAL_NET" "$EGRESS_NET" >/dev/null 2>&1 || true
+  log "torn down"
+}
+
+# ------------------------------------------------------------------- main ----
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+  --build)  build; exit 0 ;;
+  --down)   down;  exit 0 ;;
+  --agents) list_agents; exit 0 ;;
+  --logs)   exec podman logs -f "$PROXY_NAME" ;;
+  shell)
+    ensure_networks; ensure_proxy
+    AGENT_CMD=(/bin/bash); AGENT_STATE_DIRS=(); AGENT_STATE_FILES=(); AGENT_ENV=()
+    run_agent shell "${2:-$PWD}"
+    ;;
+  *)
+    load_agent "$1"
+    ensure_networks; ensure_proxy
+    run_agent "$1" "${2:-$PWD}"
+    ;;
+esac

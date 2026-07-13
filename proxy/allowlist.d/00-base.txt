@@ -1,0 +1,37 @@
+# Base allowlist — package registries and git. Applies to every agent.
+#
+# Squid dstdomain semantics:
+#   foo.example.com   exact host
+#   .example.com      example.com AND all subdomains (be careful)
+
+# github
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
+release-assets.githubusercontent.com
+
+# npm
+registry.npmjs.org
+
+# python
+pypi.org
+files.pythonhosted.org
+astral.sh
+releases.astral.sh
+
+# rust
+crates.io
+static.crates.io
+index.crates.io
+
+# go
+proxy.golang.org
+sum.golang.org
+
+# crush
+catwalk.charm.land
+hyper.charm.land
+data.charm.land
+

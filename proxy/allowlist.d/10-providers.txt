@@ -1,0 +1,11 @@
+# LLM provider endpoints. Trim to the ones you actually use — every line here
+# is a bidirectional channel out of the sandbox.
+
+api.z.ai
+models.dev
+api.anthropic.com
+# api.openai.com
+# openrouter.ai
+# generativelanguage.googleapis.com
+# api.groq.com
+# api.deepseek.com

@@ -1,0 +1,190 @@
+# agent-sandbox
+
+Rootless-podman sandbox for agentic coding tools on Arch. Agent-agnostic:
+`claude`, `opencode`, and `crush` ship as profiles; adding another is one file.
+
+Two boundaries:
+
+1. **Container** — agent runs as a non-root user with only your project mounted.
+   Nothing else from `$HOME` exists to it. No credentials.
+2. **Network** — the container sits on a podman `--internal` network. It has
+   **no route to the internet at all**. Its only reachable neighbour is a Squid
+   proxy enforcing a domain allowlist.
+
+Point 2 is the one that matters. This isn't "we set `HTTP_PROXY` and hope." If
+the agent unsets the proxy vars, or a tool ignores them, or something opens a
+raw socket to an IP — there is no gateway. It fails closed.
+
+```
+┌─ host ────────────────────────────────────────────────────────┐
+│                                                               │
+│   agent-internal (--internal, no gateway)                     │
+│   ┌──────────────────┐        ┌──────────────────┐            │
+│   │  agent container │───────▶│   agent-proxy    │            │
+│   │  /work = project │        │  squid allowlist │            │
+│   │  no creds        │        └────────┬─────────┘            │
+│   │  no route out    │                 │                      │
+│   └──────────────────┘                 │ agent-egress         │
+│                                        ▼                      │
+└───────────────────────────────────── internet ────────────────┘
+```
+
+## Usage
+
+```bash
+sudo pacman -S podman aardvark-dns netavark
+grep "^$USER:" /etc/subuid /etc/subgid   # must be non-empty for rootless
+# if empty:
+sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+podman system migrate
+
+chmod +x sandbox
+./sandbox --build
+
+./sandbox claude              # $PWD
+./sandbox opencode ~/code/x
+./sandbox crush ~/code/x
+./sandbox shell ~/code/x      # no agent, just bash — for testing the boundary
+./sandbox --logs              # every request the agent makes, every denial
+```
+
+## Why crush especially
+
+From Crush's own docs: `crush.json` is trusted code — any `$(...)` in it runs
+at load time with your shell's privileges, **before the UI appears**. They warn
+you not to launch Crush in a directory whose `crush.json` you haven't reviewed.
+
+That is arbitrary code execution triggered by `git clone && cd && crush`. Inside
+this sandbox that attacker gets: a container, an empty home directory, no keys,
+and no route out. Outside it, they get your laptop.
+
+## Adding an agent
+
+Drop `agents/<name>.sh`:
+
+```bash
+AGENT_CMD=(mytool --yolo)                     # argv to exec
+AGENT_STATE_DIRS=(".config/mytool")           # persist across runs
+AGENT_STATE_FILES=()
+AGENT_ENV=("MYTOOL_NO_UPDATE=1")
+
+agent_seed_project() { : ; }                  # optional; $1 = project dir
+```
+
+Add its domains as `proxy/allowlist.d/20-<name>.txt`, add its install line to
+the `Containerfile`. Done.
+
+State is keyed per **(agent, project)** under
+`~/.local/share/agent-sandbox/<agent>/<project>/`, so agents don't share
+sessions or auth tokens, and one project's agent state can't reach another's.
+
+## Pinning and auto-updates — read this
+
+Every one of these tools wants to update itself at runtime. In a system where
+"rebuild the image" is your reset button, that silently breaks the guarantee
+that the image is what's actually running.
+
+- **claude**: installed via the *native* installer (npm is deprecated and the
+  CLI nags). `DISABLE_AUTOUPDATER=1` is **not enough** — it only stops the
+  background check; `claude update` still works. `DISABLE_UPDATES=1` blocks
+  every path. Both are set.
+- **opencode**: auto-downloads updates on startup. Killed via
+  `"autoupdate": false` in the seeded global config.
+- **crush**: pinned at the npm install.
+
+Pin real versions in the `Containerfile` build args once you know what works.
+
+## The credential rule
+
+**No host credentials go in.** Not SSH keys, not `~/.aws`, not `gh` tokens, not
+a `.env` with prod secrets. The agent commits; **you** review the diff and push
+from the host. This single rule defuses most of what prompt injection could
+actually do, and no amount of hypervisor isolation substitutes for it.
+
+Auth each agent once *inside* the container; tokens land in the per-(agent,
+project) state dir and persist. They are never shared with your host installs.
+
+### Reviewing and pushing safely
+
+The project is mounted read-write, `.git` included, so the agent can commit.
+The catch: `.git/hooks/*` and `.git/config` are **executable configuration that
+runs on your host**, with your privileges, the moment you run `git diff`,
+`git log -p`, or `git push` in that working tree. A `pre-push` hook,
+`core.sshCommand`, `core.pager`, or a `diff.*.textconv` driver all fire from the
+repo you run the command *in* — so a hostile agent that writes them turns your
+review step into arbitrary host code execution. Two layers defend against this:
+
+1. **In the sandbox**, `.git/hooks` and `.git/config` are bind-mounted
+   read-only. Objects, refs, and the index stay writable — the agent still
+   commits normally (committer identity comes from `GIT_COMMITTER_*`, injected
+   by `./sandbox`) — but it cannot plant a hook or define a driver/`sshCommand`
+   that would run on the host later. Read-only `.git/config` is the linchpin:
+   with no way to define a `diff`/`filter` driver, a committed `.gitattributes`
+   is inert.
+
+2. **On the host**, review and push from a *fresh clone*, not the working tree.
+   A local `git clone` copies objects and refs only — never the source's hooks
+   or local config — so it is a clean room:
+
+   ```bash
+   git clone ~/code/x /tmp/review
+   git -C /tmp/review log -p origin/main..agent-branch   # safe to inspect
+   git -C /tmp/review remote add upstream <real-remote>
+   git -C /tmp/review push upstream agent-branch
+   ```
+
+   `git -c core.hooksPath=/dev/null push` from the working tree is **not**
+   enough — `core.sshCommand` still fires on push.
+
+## Verify the boundary before you trust it
+
+Do not skip this. "It started, therefore it's safe" is how people end up with a
+sandbox that isn't one.
+
+```bash
+./sandbox shell ~/code/my-project
+```
+
+Inside:
+
+```bash
+# 1. No route out. Should fail, and should NOT resolve.
+curl -x '' --max-time 5 https://example.com     # expect: failure
+getent hosts example.com                        # expect: nothing
+
+# 2. Proxy denies non-allowlisted domains.
+curl --max-time 10 https://example.com          # expect: 403 from squid
+curl --max-time 10 https://api.anthropic.com/   # expect: connects
+
+# 3. Home is empty of your real life.
+ls -la ~ ; ls ~/.ssh 2>&1                       # expect: no such file
+
+# 4. Host filesystem not visible.
+ls /home 2>&1 ; cat /etc/shadow 2>&1
+
+# 5. Files in /work come out owned by YOU on the host.
+touch /work/t && stat -c '%U' /work/t && rm /work/t
+```
+
+Test #1 is your regression check. Re-run it after every podman/netavark
+upgrade — `--internal` semantics have shifted before, and a sandbox that
+silently stops sandboxing is worse than none, because you're running YOLO in it.
+
+## Known gaps
+
+- **Squid allowlists by CONNECT hostname, not TLS content.** It doesn't
+  terminate TLS, so domain fronting / SNI tricks are theoretically possible.
+  Anthropic's docs raise the identical caveat about their own built-in proxy.
+  If you need more: swap Squid for mitmproxy with a CA in the image.
+- **Every allowlisted domain is an exfil channel.** `github.com` can create
+  issues and gists. Provider API endpoints are bidirectional pipes by design.
+  The allowlist narrows the channel; it does not close it.
+- **The allowlist is a union across all agents.** Adding an agent widens it for
+  everyone. If that bothers you, run a proxy container per agent.
+- **Container ≠ hypervisor.** A kernel exploit escapes. If you're running
+  genuinely hostile *code* (not just untrusted input), add `--runtime` with
+  Kata/libkrun — the `podman run` line is the only thing that changes.
+- **Claude's inner sandbox uses `enableWeakerNestedSandbox: true`**, because
+  bubblewrap can't mount a fresh `/proc` in an unprivileged container. That's
+  acceptable here precisely because the container is the real boundary — which
+  is the exact condition Anthropic's docs say to use it under.

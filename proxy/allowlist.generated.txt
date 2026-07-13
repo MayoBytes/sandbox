@@ -1,0 +1,53 @@
+# GENERATED from proxy/allowlist.d/ — do not edit.
+
+# --- 00-base.txt ---
+# Base allowlist — package registries and git. Applies to every agent.
+#
+# Squid dstdomain semantics:
+#   foo.example.com   exact host
+#   .example.com      example.com AND all subdomains (be careful)
+
+# github
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
+release-assets.githubusercontent.com
+
+# npm
+registry.npmjs.org
+
+# python
+pypi.org
+files.pythonhosted.org
+astral.sh
+releases.astral.sh
+
+# rust
+crates.io
+static.crates.io
+index.crates.io
+
+# go
+proxy.golang.org
+sum.golang.org
+
+# crush
+catwalk.charm.land
+hyper.charm.land
+data.charm.land
+
+
+# --- 10-providers.txt ---
+# LLM provider endpoints. Trim to the ones you actually use — every line here
+# is a bidirectional channel out of the sandbox.
+
+api.z.ai
+models.dev
+api.anthropic.com
+# api.openai.com
+# openrouter.ai
+# generativelanguage.googleapis.com
+# api.groq.com
+# api.deepseek.com

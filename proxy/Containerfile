@@ -1,0 +1,22 @@
+# Squid forward proxy — the only route out of the --internal network. It holds
+# the sole path to the internet and enforces the domain allowlist. squid.conf
+# and allowlist.txt are bind-mounted read-only at run time (see ./sandbox
+# ensure_proxy), so this image is just squid + a place to run it.
+#
+# Alpine, not archlinux like the agent image: the proxy sits on the boundary,
+# so a minimal base with a smaller attack surface is the right call, and the
+# alpine package sets up the `squid` user/dirs deterministically.
+FROM docker.io/library/alpine:3.20
+
+RUN apk add --no-cache squid ca-certificates
+
+# squid.conf logs access to /dev/stdout and cache to /dev/stderr, sets
+# `cache deny all`, and `pid_filename none` — so there is no disk cache_dir to
+# initialise and no pid file to manage. The container grants only SETUID/SETGID
+# (cap-drop ALL otherwise), which is exactly what squid's master process needs
+# to drop to the unprivileged `squid` user the alpine package created.
+EXPOSE 3128
+
+# -N: run in the foreground as PID 1 (podman needs the process to stay up).
+# -f: explicit config path — the one we bind-mount over /etc/squid/squid.conf.
+CMD ["squid", "-N", "-f", "/etc/squid/squid.conf"]
