@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+#
+# notify-send(1) work-alike for inside the sandbox. Shadows libnotify's binary
+# (/usr/local/bin precedes /usr/bin), so anything that already shells out to
+# notify-send just works.
+#
+# There is deliberately no D-Bus in this image: see notify/listener for why the
+# session bus can never come in here. The host holds the read end of $FIFO and
+# renders the notification itself.
+set -uo pipefail
+
+FIFO="${SBX_NOTIFY_FIFO:-/run/sandbox-notify}"
+[[ -p $FIFO ]] || exit 0     # no channel mounted: no-op, not an error
+
+# Parse enough of notify-send's interface to find the human text. Everything
+# else is dropped: urgency, icon, category and app-name are the HOST's to
+# decide, and honouring them here would hand a compromised agent control over
+# how its own message gets dressed up.
+while (( $# )); do
+  case $1 in
+    -u|--urgency|-t|--expire-time|-i|--icon|-c|--category|-h|--hint|-a|--app-name|-A|--action|-r|--replace-id)
+      if (( $# >= 2 )); then shift 2; else shift; fi ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *)  break ;;
+  esac
+done
+
+msg="${1:-}"
+[[ -n ${2:-} ]] && msg="$msg — $2"
+[[ -n $msg ]] || exit 0
+
+# One line, and short enough that the write lands in a single sub-PIPE_BUF
+# write(2) — otherwise concurrent notifiers interleave into each other's
+# messages. The host sanitizes and truncates again regardless; this side is
+# untrusted and gets no benefit of the doubt.
+msg=${msg//$'\n'/ }
+msg=${msg//$'\r'/ }
+msg=${msg:0:400}
+
+# Never block. With no listener holding the read end, open(2) on a FIFO waits
+# forever — a missed notification is fine, a wedged agent is not.
+printf '%s\n' "$msg" | timeout 0.5 tee "$FIFO" >/dev/null 2>&1 || true
+exit 0

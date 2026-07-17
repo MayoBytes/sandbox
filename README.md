@@ -219,6 +219,20 @@ manually with `--build-arg` (`./sandbox --build` uses the defaults as-is).
   The allowlist narrows the channel; it does not close it.
 - **The allowlist is a union across all agents.** Adding an agent widens it for
   everyone. If that bothers you, run a proxy container per agent.
+- **Notifications are a second channel out, and a real one.** The agent picks
+  the text and you read it, so it can encode data into a notification body. What
+  makes it an acceptable trade rather than a hole: it's a bare FIFO (no D-Bus —
+  see below), the host renders it and can ignore it, the body is capped at ~200
+  bytes and rate-limited to one per two seconds, and you're the only receiver.
+  It carries no authority in either direction. `SBX_NOTIFY=0 ./sandbox …` opts
+  out; the box then has no path back to the host but the proxy.
+  The title is *always* host-generated (`sandbox: <agent> — <project>`) so a
+  compromised agent can't dress its message up as a system prompt. Note the
+  corollary: **never bind-mount the host D-Bus session socket in to get real
+  `notify-send`.** The session bus is a desktop control plane — keyring secrets
+  via `org.freedesktop.secrets`, arbitrary host exec via systemd `--user` — and
+  handing it to the box would end the boundary outright. That's why there's no
+  `libnotify` in the image.
 - **Container ≠ hypervisor.** A kernel exploit escapes. If you're running
   genuinely hostile *code* (not just untrusted input), add `--runtime` with
   Kata/libkrun — the `podman run` line is the only thing that changes.

@@ -24,6 +24,10 @@ whether it preserves that boundary.
 - `proxy/allowlist.generated.txt` — **generated**, git-ignored. Never edit by
   hand; it's rebuilt from `allowlist.d/*.txt` by `render_allowlist()` in
   `sandbox`. Edit the `.d/` sources instead.
+- `notify/` — the notification channel, in two halves that never share a
+  process. `listener` runs on the **host** (long-lived, shared, started by
+  `ensure_notifier`); `notify-send` is the in-image shim that replaces
+  libnotify. They meet at a per-run FIFO and exchange nothing but text.
 
 ## Invariants — do not break these
 
@@ -35,19 +39,28 @@ must be called out explicitly, never made silently.
    nothing else. Egress exists *only* because the proxy is dual-homed onto both
    the internal net and a separate egress net. Don't attach the agent container
    to any other network, and don't give the internal net a route out.
-2. **The proxy is the sole egress path and enforces the allowlist.** Don't add
-   bypasses. New reachable domains go in `allowlist.d/`, and every added domain
-   is a bidirectional exfil channel — justify it.
-3. **No host credentials enter the container.** No SSH keys, cloud creds, or
+2. **The proxy is the sole *network* egress path and enforces the allowlist.**
+   Don't add bypasses. New reachable domains go in `allowlist.d/`, and every
+   added domain is a bidirectional exfil channel — justify it.
+3. **The notification FIFO is the only non-proxy channel out, and stays
+   bytes-only.** One line of text, host-rendered, ~200 bytes, rate-limited, and
+   it carries no authority. Keep it that way: it must never gain a reverse
+   direction, a way to name a command, or anything the host executes. Above all,
+   **never mount the host D-Bus session socket** to get a "real" `notify-send` —
+   the session bus is a desktop control plane (keyring secrets, systemd `--user`
+   exec) and it would end the boundary in one line. That's why the image has no
+   libnotify. The notification *title* is host-generated on purpose; letting the
+   agent choose it buys it system-prompt impersonation.
+4. **No host credentials enter the container.** No SSH keys, cloud creds, or
    tokens mounted in. Only the project (`/work`) and per-(agent,project) state.
-4. **`.git/hooks` and `.git/config` are bind-mounted read-only.** They're
+5. **`.git/hooks` and `.git/config` are bind-mounted read-only.** They're
    host-executing config (hooks, `core.sshCommand`, `diff.*.textconv`). Keep the
    `git_guard` mounts in `run_agent`. Objects/refs/index stay writable so the
    agent can still commit.
-5. **Hardening flags on `podman run` stay on**: `--userns keep-id`,
+6. **Hardening flags on `podman run` stay on**: `--userns keep-id`,
    `--security-opt no-new-privileges`, `--cap-drop ALL` (the proxy adds back
    only SETUID/SETGID), `--pids-limit`, `--memory`.
-6. **The image is the reset point.** Auto-update is disabled for every tool
+7. **The image is the reset point.** Auto-update is disabled for every tool
    (`DISABLE_UPDATES=1`, opencode `autoupdate: false`, crush pinned). A change
    that lets a tool mutate itself at runtime breaks "rebuild = known state".
 

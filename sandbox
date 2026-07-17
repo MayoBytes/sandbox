@@ -25,6 +25,10 @@ INTERNAL_NET="agent-internal"   # --internal: NO egress. This is the boundary.
 EGRESS_NET="agent-egress"
 PROXY_NAME="agent-proxy"
 STATE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/agent-sandbox"
+# Notification FIFOs. Runtime dir on purpose: tmpfs, 0700, wiped at logout — a
+# channel out of the box should not outlive the session that opened it.
+NOTIFY_DIR="${XDG_RUNTIME_DIR:-/tmp}/agent-sandbox/notify"
+NOTIFY_ENABLED=0
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33mwarn:\033[0m %s\n' "$*" >&2; }
@@ -115,6 +119,31 @@ ensure_proxy() {
   fi
 }
 
+# ---------------------------------------------------------------- notifier ---
+# FIFOs are deliberately left in place between runs rather than swept: they are
+# named per (agent, project) and the label is derived from that name, so a
+# leftover can only ever be reused by the run it already describes. The cost of
+# keeping one is a reader parked in open(2); the cost of deleting one is a
+# recreated inode the listener won't notice (see run_agent). Bounded anyway —
+# XDG_RUNTIME_DIR is tmpfs, and --down wipes it.
+#
+# Long-lived and shared, exactly like the proxy — deliberately NOT tied to this
+# invocation. run_agent ends in exec, so there is no shell left to reap a
+# per-run listener; and one that died on detach would leave a reattached
+# container writing into a FIFO nobody reads, silently. Set SBX_NOTIFY=0 to
+# opt out of the channel entirely.
+ensure_notifier() {
+  NOTIFY_ENABLED=0
+  [[ "${SBX_NOTIFY:-1}" == 0 ]] && return 0
+  command -v notify-send >/dev/null 2>&1 \
+    || { warn "no notify-send on host — notifications disabled"; return 0; }
+
+  mkdir -p "$NOTIFY_DIR"; chmod 700 "$NOTIFY_DIR"
+  # The listener flocks internally, so starting a second one is a no-op.
+  setsid -f "$HERE/notify/listener" >>"$NOTIFY_DIR/listener.log" 2>&1 || true
+  NOTIFY_ENABLED=1
+}
+
 # -------------------------------------------------------------------- run ----
 run_agent() {
   local agent="$1" project="$2"
@@ -167,6 +196,27 @@ run_agent() {
     [[ -f "$project/.git/config" ]] && git_guard+=(-v "$project/.git/config:/work/.git/config:ro,Z")
   fi
 
+  # The notification channel: one FIFO, bind-mounted as a single file. This is
+  # the only path from the box back to the host that isn't the proxy, so weigh
+  # it as such — it IS an exfil channel, since the agent chooses the text and
+  # you read it. What makes it an acceptable one: ~200 bytes per message,
+  # rate-limited on the host, you are the only receiver, and it carries no
+  # authority — the host renders it and is free to ignore it. No :Z; relabeling
+  # a file in the host's runtime dir is not ours to do (and Arch has no SELinux).
+  # The .label sidecar is never mounted, so attribution stays host-owned.
+  local notify_mount=() fifo
+  if (( NOTIFY_ENABLED )); then
+    fifo="$NOTIFY_DIR/$agent-$slug.fifo"
+    # Reuse, never recreate. rm+mkfifo would put a NEW inode at this path while
+    # the listener's reader is still parked in open(2) on the old one: the
+    # reader stays alive, so the listener (which tracks readers by path) never
+    # spawns one for the new inode, and every run after the first goes to a
+    # pipe nobody is holding. Same path, same inode, same reader.
+    [[ -p $fifo ]] || { rm -f "$fifo"; mkfifo -m 600 "$fifo"; }
+    printf '%s — %s\n' "$agent" "${base:-project}" > "$NOTIFY_DIR/$agent-$slug.label"
+    notify_mount=(-v "$fifo:/run/sandbox-notify")
+  fi
+
   if declare -F agent_seed_project >/dev/null; then
     agent_seed_project "$project"
   fi
@@ -174,6 +224,7 @@ run_agent() {
   log "agent:   $agent"
   log "project: $project"
   log "network: $INTERNAL_NET (egress only via $PROXY_NAME)"
+  (( NOTIFY_ENABLED )) && log "notify:  /run/sandbox-notify -> host desktop"
 
   exec podman run --rm -it \
     --name "sbx-$agent-$slug-$$" \
@@ -197,6 +248,7 @@ run_agent() {
     "${mounts[@]}" \
     -v "$project:/work:Z" \
     "${git_guard[@]}" \
+    "${notify_mount[@]}" \
     -w /work \
     "$IMAGE" "${AGENT_CMD[@]}"
 }
@@ -204,6 +256,12 @@ run_agent() {
 down() {
   podman rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
   podman network rm -f "$INTERNAL_NET" "$EGRESS_NET" >/dev/null 2>&1 || true
+  # The listener lives until here (or logout wipes the runtime dir), like the
+  # proxy — it has no idle-timeout, so --down is its only planned exit. SIGTERM
+  # to the leader; its TERM trap reaps the per-FIFO readers via the group kill.
+  [[ -f "$NOTIFY_DIR/.listener.pid" ]] \
+    && kill "$(cat "$NOTIFY_DIR/.listener.pid")" 2>/dev/null || true
+  rm -rf "$NOTIFY_DIR"
   log "torn down"
 }
 
@@ -215,13 +273,13 @@ case "${1:-}" in
   --agents) list_agents; exit 0 ;;
   --logs)   exec podman logs -f "$PROXY_NAME" ;;
   shell)
-    ensure_networks; ensure_proxy
+    ensure_networks; ensure_proxy; ensure_notifier
     AGENT_CMD=(/bin/bash); AGENT_STATE_DIRS=(); AGENT_STATE_FILES=(); AGENT_ENV=()
     run_agent shell "${2:-$PWD}"
     ;;
   *)
     load_agent "$1"
-    ensure_networks; ensure_proxy
+    ensure_networks; ensure_proxy; ensure_notifier
     run_agent "$1" "${2:-$PWD}"
     ;;
 esac

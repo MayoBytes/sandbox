@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+#
+# notify-listener — host side of the sandbox notification channel.
+#
+# Runs on the HOST, outside every boundary ./sandbox establishes. Agent
+# containers write lines into per-run FIFOs under $NOTIFY_DIR; this reads them
+# and renders the desktop notification itself. That inversion is the entire
+# point. The obvious implementation — libnotify in the image, host D-Bus socket
+# bind-mounted in — hands the box a session bus, which is not a notification
+# channel but the control plane for the whole desktop session: org.freedesktop
+# .secrets (every credential in the keyring), systemd --user StartTransientUnit
+# (arbitrary host exec as you), portals. One mount and the sandbox is decorative.
+# So nothing but bytes crosses, and this side decides what they mean.
+#
+# Long-lived and shared, like the proxy: a listener tied to a ./sandbox
+# invocation would die the moment you detach, and `podman attach` runs no
+# sandbox code that could restart it.
+#
+# EVERY BYTE READ HERE IS HOSTILE INPUT. See emit().
+set -euo pipefail
+
+NOTIFY_DIR="${SBX_NOTIFY_DIR:-${XDG_RUNTIME_DIR:-/tmp}/agent-sandbox/notify}"
+RATE_SECONDS=2      # per-run floor between notifications
+MAX_LEN=200
+
+mkdir -p "$NOTIFY_DIR"
+chmod 700 "$NOTIFY_DIR"
+
+# Singleton. Two listeners on one FIFO race read(2) and each takes a random
+# half of the messages, which looks exactly like flaky notifications.
+exec 9>"$NOTIFY_DIR/.listener.lock"
+flock -n 9 || exit 0
+
+# setsid(1) makes us a process-group leader, so the negative kill takes the
+# per-FIFO readers with us. Without it they outlive the parent and keep the
+# FIFOs open.
+echo $$ > "$NOTIFY_DIR/.listener.pid"
+# EXIT does the reaping; TERM/INT just fall into it. Trapping the signals is
+# load-bearing, not decoration: ./sandbox --down SIGTERMs this leader PID, and
+# whether bash runs an EXIT trap on an otherwise-untrapped fatal signal is
+# version-dependent. Handle TERM/INT explicitly so the negative kill that takes
+# the per-FIFO readers down always happens.
+cleanup() { rm -f "$NOTIFY_DIR/.listener.pid"; kill -- -$$ 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'exit 0' TERM INT
+
+# Untrusted text -> notify-send argv.
+#   - control chars stripped: ANSI escapes can rewrite the notification, NUL and
+#     newlines split one message into several.
+#   - pango escaped: dunst and friends render markup in the body.
+#   - truncated: a megabyte message is a denial of your desktop.
+#   - passed after --, never eval'd, and the SUMMARY is OURS. An agent that
+#     picks its own title can impersonate a system prompt ("session expired,
+#     re-enter your password"). It controls the body and nothing else.
+emit() {
+  local label=$1 body=$2
+  body=$(printf '%s' "$body" | tr -d '\000-\037\177\200-\237')
+  # The backslashes are load-bearing: since bash 5.2 an unquoted & in the
+  # replacement means "the text that matched", so ${body//</&lt;} expands to
+  # "<lt;" and quietly turns this escaping into a no-op.
+  body=${body//&/\&amp;}
+  body=${body//</\&lt;}
+  body=${body//>/\&gt;}
+  body=${body:0:MAX_LEN}
+  [[ -z ${body//[[:space:]]/} ]] && return 0
+  notify-send --app-name=agent-sandbox --urgency=low -- "sandbox: $label" "$body" || true
+}
+
+# The label comes from a sidecar written by ./sandbox and never mounted into the
+# container, so attribution is host-owned: a compromised agent cannot relabel
+# its messages as another project's.
+reader() {
+  # last=0 would be a lie — it claims we notified at listener start, so the
+  # first message (the one that actually matters) gets eaten by the rate limit
+  # if it lands within RATE_SECONDS of startup. Backdate instead.
+  local fifo=$1 label line now last=$(( -RATE_SECONDS ))
+  label=$(cat "${fifo%.fifo}.label" 2>/dev/null || echo "unknown")
+  while [[ -p $fifo ]]; do
+    # Blocks in open(2) until a writer appears — not a spin. Returns EOF when the
+    # last writer closes, so reopen in a loop until the FIFO itself is gone.
+    while IFS= read -r line; do
+      now=$SECONDS
+      (( now - last < RATE_SECONDS )) && continue   # rate limit: drop, don't queue
+      last=$now
+      emit "$label" "$line"
+    done < "$fifo"
+    sleep 0.2
+  done
+}
+
+declare -A pids=()
+
+# Lives until ./sandbox --down (or logout wiping XDG_RUNTIME_DIR), exactly like
+# the proxy. No idle-timeout on purpose: FIFOs are persistent — run_agent reuses
+# the inode so the reader below stays attached across runs — so "no FIFOs left"
+# only happens after --down, which kills us directly. There is no moment the box
+# is between runs that the host can see, so there is nothing to time out on.
+while true; do
+  for fifo in "$NOTIFY_DIR"/*.fifo; do
+    [[ -p $fifo ]] || continue      # no glob match -> literal string -> skipped
+    if [[ -z ${pids[$fifo]:-} ]] || ! kill -0 "${pids[$fifo]}" 2>/dev/null; then
+      reader "$fifo" &
+      pids[$fifo]=$!
+    fi
+  done
+
+  for fifo in "${!pids[@]}"; do
+    [[ -p $fifo ]] && continue
+    kill "${pids[$fifo]}" 2>/dev/null || true
+    unset 'pids[$fifo]'
+  done
+
+  sleep 1
+done

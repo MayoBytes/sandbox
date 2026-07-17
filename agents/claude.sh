@@ -33,7 +33,7 @@ agent_seed_project() {
     "enableWeakerNestedSandbox": true,
 
     "filesystem": {
-      "allowWrite": ["/work"]
+      "allowWrite": ["/work", "/run/sandbox-notify"]
     },
 
     "network": {
@@ -69,6 +69,17 @@ agent_seed_project() {
         { "name": "ANTHROPIC_API_KEY", "mode": "deny" }
       ]
     }
+  },
+
+  "hooks": {
+    "Notification": [
+      { "hooks": [ { "type": "command",
+                     "command": "jq -j '.message // empty' | xargs -0 -r notify-send --" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command",
+                     "command": "notify-send -- 'finished'" } ] }
+    ]
   }
 }
 JSON

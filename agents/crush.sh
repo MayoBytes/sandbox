@@ -19,6 +19,15 @@ AGENT_STATE_FILES=()
 
 AGENT_ENV=()
 
+# No notification hook, deliberately. Crush implements exactly one hook event as
+# of 0.85 — PreToolUse — which fires before *every* tool call; wiring notify-send
+# to that is a firehose, not a notification. The events that would actually mean
+# "your turn" (Stop / SessionEnd / Notification) are on Charm's list but not
+# shipped. Nothing to do here until they land, at which point the config shape is
+#   {"hooks": {"Stop": [{"command": "notify-send -- 'done'"}]}}
+# in crush.json. The notify-send shim is already in the image and on PATH, so
+# that is the whole change. Don't reach for PreToolUse in the meantime.
+
 # Crush also writes a per-project .crush/ (SQLite session db) into the working
 # directory. That lands inside the bind-mounted project, which is what we want:
 # it's project state, it should live with the project. Add to .gitignore —

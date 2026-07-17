@@ -21,6 +21,12 @@ RUN pacman -Syu --noconfirm \
   && pacman -Scc --noconfirm \
   && rm -rf /var/cache/pacman/pkg/*
 
+# Notifications go out over a pipe, not D-Bus — deliberately NO libnotify here.
+# Real notify-send needs the host session bus, which is a desktop control plane
+# (keyring secrets, systemd --user exec), not a message channel. This shim takes
+# its place on PATH and writes to the FIFO ./sandbox mounts at /run/sandbox-notify.
+COPY --chmod=755 notify/notify-send /usr/local/bin/notify-send
+
 RUN useradd -m -u 1000 -s /bin/bash agent
 USER agent
 ENV HOME=/home/agent
