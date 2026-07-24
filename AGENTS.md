@@ -92,6 +92,12 @@ must be called out explicitly, never made silently.
 - **Adding an agent.** Drop `agents/<name>.sh`, add its domains as
   `proxy/allowlist.d/20-<name>.txt`, add its install to `Containerfile`. Prefer
   the tool's native/pinned installer over one that self-updates.
+- **Heavy optional layers go behind a build arg and a second image tag**, not
+  into the default image — see `WITH_PADDLE` and the `SBX_IMAGE` /
+  `SBX_BUILD_ARGS` overrides in `sandbox`. Anything new added to `build()` must
+  stay bash-3.2 array-safe (see the `bargs` append there): an inline
+  `"${arr[@]}"` on a possibly-empty array aborts `--build` on macOS under
+  `set -u`, and it aborts it for *everyone*, not just users of the variant.
 - **This repo is single-user-tailored on purpose.** Don't generalize it
   (multi-user, other container runtimes) unless asked — see README framing.
 - **Two host platforms: Linux and macOS.** Every platform difference lives in the

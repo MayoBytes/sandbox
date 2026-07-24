@@ -1,0 +1,9 @@
+# oil-rag — PaddlePaddle/PaddleOCR install hosts.
+#
+# Paddle's ROCm/GPU wheels are NOT on PyPI; pip pulls them from Paddle's own
+# index and object store. Each line here is a bidirectional exfil channel and,
+# because the allowlist is a union, widens egress for EVERY agent — not just
+# oil-rag. Justified only while a box actually needs to fetch these wheels;
+# prefer baking the wheel into the image and dropping this file if you can.
+www.paddlepaddle.org.cn
+paddle-whl.bj.bcebos.com

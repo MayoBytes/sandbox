@@ -19,7 +19,11 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE="agent-sandbox:latest"
+# Overridable so a heavy opt-in variant (e.g. WITH_PADDLE=1, ~1GB of wheels)
+# doesn't have to become every project's base image:
+#   SBX_BUILD_ARGS="--build-arg WITH_PADDLE=1" SBX_IMAGE=agent-sandbox:paddle ./sandbox --build
+#   SBX_IMAGE=agent-sandbox:paddle ./sandbox claude ~/git/oil-rag
+IMAGE="${SBX_IMAGE:-agent-sandbox:latest}"
 PROXY_IMAGE="agent-sandbox-proxy:latest"
 INTERNAL_NET="agent-internal"   # --internal: NO egress. This is the boundary.
 EGRESS_NET="agent-egress"
@@ -175,7 +179,17 @@ build() {
   log "building $PROXY_IMAGE"
   podman build -t "$PROXY_IMAGE" "$HERE/proxy"
   log "building $IMAGE"
-  podman build -t "$IMAGE" "$HERE"
+  # Word-split on purpose: SBX_BUILD_ARGS carries whole flags ("--build-arg X=1").
+  local extra=()
+  [[ -n "${SBX_BUILD_ARGS:-}" ]] && read -ra extra <<< "$SBX_BUILD_ARGS"
+  # Appended into an always-populated array rather than expanded inline, for the
+  # same bash-3.2 reason spelled out at the `run` array in run_agent: with
+  # SBX_BUILD_ARGS unset, "${extra[@]}" is an unbound-variable ABORT under set -u
+  # on macOS. That would break --build for everyone, paddle or not.
+  local bargs=(build)
+  if (( ${#extra[@]} )); then bargs+=("${extra[@]}"); fi
+  bargs+=(-t "$IMAGE" "$HERE")
+  podman "${bargs[@]}"
 }
 
 ensure_networks() {

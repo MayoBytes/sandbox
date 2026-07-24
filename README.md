@@ -266,6 +266,97 @@ The `Containerfile` exposes `CLAUDE_VERSION`, `OPENCODE_VERSION`, and
 know a version works, pin it — edit the `ARG` defaults, or build the image
 manually with `--build-arg` (`./sandbox --build` uses the defaults as-is).
 
+## Optional: PaddleOCR (CPU)
+
+Off by default, as a separate image tag rather than something every project
+carries. Measured on Apple Silicon (`podman system df -v`): the paddle tag is
+**4.1 GB** against the default tag's **2.0 GB**, and keeping both costs about
+**1.0 GB** on top of the default — that's the tag's `UNIQUE SIZE`, since the two
+share the base and the large `dnf` layer.
+
+That sharing is why `ARG WITH_PADDLE` is declared at its first use, low in the
+`Containerfile`, rather than up with the other build args: an `ARG` whose value
+differs invalidates the cache from its declaration onward, so hoisting it makes a
+`WITH_PADDLE=1` build re-run the base package install instead of reusing it.
+
+```bash
+# build the variant once
+SBX_BUILD_ARGS="--build-arg WITH_PADDLE=1" SBX_IMAGE=agent-sandbox:paddle ./sandbox --build
+
+# run against it
+SBX_IMAGE=agent-sandbox:paddle ./sandbox claude ~/code/my-ocr-project
+```
+
+`SBX_IMAGE` and `SBX_BUILD_ARGS` are general-purpose: any image tag, any extra
+`podman build` flags. Without them nothing changes — the default image is built
+and run exactly as before.
+
+**Paddle lives in its own Python 3.12 venv at `$OCR_VENV`
+(`/home/agent/.venvs/ocr`), not the system interpreter.** Fedora 44 ships Python
+3.14 and PaddlePaddle has no cp314 wheel — 3.3.x tops out at cp313, 2.6.2 at
+cp312 — so a plain `pip install paddlepaddle` fails in the image exactly as it
+does on the host. `uv` installs a standalone 3.12 alongside, leaving system
+Python alone. Use it explicitly:
+
+```bash
+"$OCR_VENV/bin/python" -m pytest             # or
+uv pip install --python "$OCR_VENV/bin/python" -e /work/mypkg
+```
+
+**The models are baked at build time, so OCR needs no egress.** PaddleOCR
+otherwise fetches det/rec/cls from `bcebos.com` on first use, which a box with no
+route out cannot do. Baking them means the *running* box needs **no allowlist
+entry to do OCR** — `podman build` runs outside the proxy (on the host on Linux,
+inside the VM on macOS, but never through Squid either way), so build-time
+downloads cost nothing at the boundary. Verify with the network removed entirely:
+
+```bash
+# literal path, not $OCR_VENV — that variable exists inside the image, and your
+# host shell would expand it to nothing before podman ever sees it
+podman run --rm --network none agent-sandbox:paddle \
+  /home/agent/.venvs/ocr/bin/python -c "from paddleocr import PaddleOCR; print('ok')"
+```
+
+Four things in that layer are load-bearing. Three fail loudly if you change
+them; the first fails *silently*, which is why it's first:
+
+- **`paddleocr>=2.7,<3`** — 3.x changed the return shape of `.ocr()`. Unpinned,
+  pip resolves to 3.x and any parser written against the 2.x
+  `[quad, (text, conf)]` output breaks *silently*.
+- **`paddlepaddle==2.6.2` is also what keeps arm64 working.** Paddle ships
+  `manylinux2014_aarch64` wheels through 3.2.x and **dropped them at 3.3.0**,
+  which is x86_64 + macOS-arm64 only on PyPI. Since podman on an Apple Silicon
+  host builds natively for `linux/arm64`, bumping this past 3.2.x means no wheel
+  exists and the layer dies at install. The rest of the tree is fine on arm64:
+  shapely, pyclipper, lmdb, scikit-image, rapidfuzz and opencv-python all have
+  cp312 aarch64 wheels, and imgaug/albumentations/albucore are pure Python.
+- **`setuptools`** — Paddle 2.6.2 imports it at package-import time, and
+  `uv venv` seeds no setuptools (nor does Python 3.12 ship one implicitly).
+  Without it `import paddle` dies with `ModuleNotFoundError` before any OCR runs.
+- **`mesa-libGL`** — PaddleOCR pulls `opencv-python`, which links `libGL.so.1`;
+  the Fedora base image has no such library. The failure reads like a paddle bug
+  and isn't one. (The soname actually comes from `libglvnd-glx`, which
+  `mesa-libGL` pulls in.)
+
+**This is the CPU path, and on both supported hosts it is the only path.** On
+macOS there is no GPU option at all: the container runs inside the podman machine
+VM, which gets neither Metal nor CUDA passthrough — an Apple Silicon GPU is
+simply not visible to it, so don't go looking for a `paddlepaddle-gpu` variant.
+On an AMD Linux host it's the only path for a different reason: PaddlePaddle's
+ROCm wheels target gfx906/DCU, not RDNA3 (gfx1100, e.g. a 7900 XT), so there is
+no working `paddlepaddle-gpu` for those GPUs — in this sandbox or on bare metal.
+Don't add `--device /dev/kfd` expecting Paddle to use it. An NVIDIA Linux host is
+a different question and would need its own image layer.
+
+Expect it to be slower on arm64 than on x86_64 — Paddle's ARM builds get neither
+oneDNN nor MKL. It works; it isn't the fast path.
+
+`proxy/allowlist.d/20-oil-rag.txt` is a separate matter: it opens Paddle's own
+wheel index for the GPU wheels, which are not on PyPI and which nothing in this
+image installs. Nothing above needs it. It's kept for the case where a Linux box
+wants to `pip install paddlepaddle-gpu` at run time; delete the file if you don't
+— every line in there widens egress for **every** agent, not just this one.
+
 ## Known gaps
 
 - **Squid allowlists by CONNECT hostname, not TLS content.** It doesn't

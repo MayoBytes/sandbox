@@ -35,3 +35,8 @@ catwalk.charm.land
 hyper.charm.land
 data.charm.land
 
+# claude api docs. platform.claude.com is deliberately NOT here — it's an API
+# endpoint and lives in 10-providers.txt; the generated file is a plain
+# concatenation, so a second copy would just be a duplicate dstdomain.
+docs.claude.com
+code.claude.com
