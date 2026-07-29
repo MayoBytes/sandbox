@@ -36,13 +36,21 @@ raw socket to an IP — there is no gateway. It fails closed.
 
 ## Requirements
 
-- Arch Linux (or a distro where you can install the equivalent packages).
-- `podman`, `aardvark-dns`, `netavark`.
-- Rootless podman: a non-empty subuid/subgid range for your user (the quickstart
-  sets this up). Root is needed only to install packages and to grant that range
-  once — never to *run* the sandbox.
+- **Linux** (developed on Arch) or **macOS** (Apple Silicon).
+- `podman`. On Linux also `aardvark-dns` and `netavark`; on macOS they ship
+  inside the VM.
+- On Linux, rootless podman needs a non-empty subuid/subgid range for your user
+  (the quickstart sets this up). Root is needed only to install packages and to
+  grant that range once — never to *run* the sandbox.
+
+The boundary is kernel work: an `--internal` netavark network, dropped
+capabilities, cgroup limits, a user namespace. macOS has none of that, so
+`podman machine` supplies a real Linux kernel in a VM and the same enforcement
+happens there. The agent image and the proxy are identical on both.
 
 ## Quickstart
+
+### Linux
 
 ```bash
 # 1. Install podman + the rootless networking stack.
@@ -53,7 +61,37 @@ grep "^$USER:" /etc/subuid /etc/subgid        # must print two non-empty lines
 # If empty:
 sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
 podman system migrate
+```
 
+### macOS
+
+```bash
+# 1. Install podman.
+brew install podman
+
+# 2. Create the VM. Two things here are not the defaults and both matter:
+#
+#    --memory must exceed the 8g the agent container asks for, or that limit is
+#    one the kernel cannot honour and you get OOM-killed mid-session.
+#
+#    --volume REPLACES the default "share all of $HOME" with just the paths you
+#    name. Do this. The default hands your entire home directory to the VM; the
+#    container still only sees /work, but there is no reason to widen the VM's
+#    view either. Name your code root and the state dir, nothing else.
+mkdir -p ~/.local/share/agent-sandbox
+podman machine init --cpus 6 --memory 12288 --disk-size 100 \
+  --volume "$HOME/git:$HOME/git" \
+  --volume "$HOME/.local/share/agent-sandbox:$HOME/.local/share/agent-sandbox"
+podman machine start
+```
+
+A project outside those shared paths will not error — it would mount **empty**,
+and the agent would run against nothing and look like it worked. `./sandbox`
+checks for this and refuses, but the fix is to keep projects under a shared root.
+
+### Both
+
+```bash
 # 3. Build the agent + proxy images.
 chmod +x sandbox
 ./sandbox --build
@@ -110,11 +148,31 @@ ls /home 2>&1 ; cat /etc/shadow 2>&1
 
 # 5. Files in /work come out owned by YOU on the host.
 touch /work/t && stat -c '%U' /work/t && rm /work/t
+
+# 6. The .git guard held: both of these must FAIL.
+touch /work/.git/hooks/pre-push           # expect: read-only file system
+git -C /work config --local user.name x   # expect: failure
 ```
 
 Test #1 is your regression check. Re-run it after every podman/netavark
 upgrade — `--internal` semantics have shifted before, and a sandbox that
 silently stops sandboxing is worse than none, because you're running YOLO in it.
+
+**On macOS, two of these prove less than they do on Linux.** Read them
+accordingly rather than ticking them off:
+
+- **#1** now means "no route out of the VM". Still fail-closed, still the right
+  check — but your exposure now also tracks `podman machine` and gvproxy
+  versions, not just netavark's. Re-run it after upgrading either.
+- **#5** passes for a different reason. On Linux it demonstrates
+  `--userns keep-id` mapping your uid. On macOS that flag maps the *VM's* user,
+  and what you see from the Mac is decided by the virtiofs id mapping — which is
+  lax about ownership by design. The file comes out yours; the mechanism is not
+  the one the flag names.
+- **#6** is worth running on macOS specifically. `.git/config` is a single file,
+  rewritten by rename, bind-mounted read-only *inside* the `/work` mount — the
+  fragile case for virtiofs. It is also the linchpin of
+  [The credential rule](#the-credential-rule), so verify it rather than assume it.
 
 ## The credential rule
 
@@ -233,9 +291,21 @@ manually with `--build-arg` (`./sandbox --build` uses the defaults as-is).
   via `org.freedesktop.secrets`, arbitrary host exec via systemd `--user` — and
   handing it to the box would end the boundary outright. That's why there's no
   `libnotify` in the image.
+- **Notifications don't work on macOS**, and the tool says so instead of
+  half-working. Three separate things block it: a host FIFO can't cross virtiofs
+  into the VM as a pipe (the shim's `[[ -p $FIFO ]]` check fails and it no-ops),
+  the listener needs bash 4 associative arrays and `flock` and macOS has neither,
+  and an `osascript` renderer would reintroduce exactly the string-injection
+  surface the argv-based `notify-send` call was built to avoid. Any future macOS
+  transport has to stay one-way and bytes-only, and keep the host-generated title
+  and the size cap — otherwise it's a worse channel than the one it replaces.
 - **Container ≠ hypervisor.** A kernel exploit escapes. If you're running
   genuinely hostile *code* (not just untrusted input), add `--runtime` with
-  Kata/libkrun — the `podman run` line is the only thing that changes.
+  Kata/libkrun — the `podman run` line is the only thing that changes. On macOS
+  you get a hypervisor boundary for free, since the whole podman stack already
+  runs in a VM — the one respect in which the Mac is the stronger of the two.
+  Note the flip side: the VM is a trust surface the Linux host doesn't have, and
+  it sees whatever you shared into it at `machine init`. Share narrowly.
 - **Claude's inner sandbox uses `enableWeakerNestedSandbox: true`**, because
   bubblewrap can't mount a fresh `/proc` in an unprivileged container. That's
   acceptable here precisely because the container is the real boundary — which

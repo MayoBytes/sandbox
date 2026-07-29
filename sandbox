@@ -25,14 +25,55 @@ INTERNAL_NET="agent-internal"   # --internal: NO egress. This is the boundary.
 EGRESS_NET="agent-egress"
 PROXY_NAME="agent-proxy"
 STATE_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/agent-sandbox"
-# Notification FIFOs. Runtime dir on purpose: tmpfs, 0700, wiped at logout — a
-# channel out of the box should not outlive the session that opened it.
-NOTIFY_DIR="${XDG_RUNTIME_DIR:-/tmp}/agent-sandbox/notify"
 NOTIFY_ENABLED=0
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33mwarn:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------- host --
+# The boundary itself is kernel work — netavark's --internal network, caps,
+# cgroups, userns — so it is identical on macOS, where podman machine supplies a
+# real Linux kernel in a VM. Only the thin layer of host-side shell differs.
+# Every platform difference is resolved HERE. Nothing below this block branches
+# on the OS again; if you find yourself adding a second `case $HOST`, add a shim
+# up here instead.
+case "$(uname -s)" in
+  Darwin) HOST=darwin ;;
+  Linux)  HOST=linux  ;;
+  *) die "unsupported host: $(uname -s)" ;;
+esac
+
+if [[ $HOST == linux ]]; then
+  # SELinux MCS relabelling. Vestigial on Arch already (see the notify mount),
+  # but harmless and correct where SELinux does exist.
+  Z=':Z'; ROZ=':ro,Z'
+  # Runtime dir on purpose: tmpfs, 0700, wiped at logout — a channel out of the
+  # box should not outlive the session that opened it.
+  NOTIFY_DIR="${XDG_RUNTIME_DIR:-/tmp}/agent-sandbox/notify"
+else
+  # No SELinux to relabel for, and podman cannot chcon a virtiofs-backed path
+  # inside the VM anyway — it errors or silently no-ops depending on version.
+  Z=''; ROZ=':ro'
+  # XDG_RUNTIME_DIR is unset on macOS, and the /tmp fallback would be neither
+  # per-user nor 0700. $TMPDIR (/var/folders/…) is both. It is NOT tmpfs and
+  # survives logout, so the "does not outlive the session" property is weaker
+  # here — see README "Known gaps".
+  NOTIFY_DIR="${TMPDIR:-/tmp}/agent-sandbox/notify"
+fi
+
+# No realpath on stock macOS, and macOS readlink has no -f. $project is
+# -d-checked before this is called, so the subshell cd is exact for our one use
+# — and it drops a coreutils dependency on Linux too.
+sbx_realpath() { (cd "$1" && pwd -P); }
+
+# No sha256sum on stock macOS. Both spellings emit "<hex>  -", so the truncated
+# digest is byte-identical across platforms and existing state dirs keyed by it
+# are not orphaned. Do not "simplify" this to openssl dgst — that prints a
+# different format and would silently re-key every project's state.
+sbx_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
+}
 
 # ---------------------------------------------------------------- allowlist --
 # Squid takes one dstdomain file, so concatenate allowlist.d/*.txt into it.
@@ -70,8 +111,66 @@ load_agent() {
   [[ ${#AGENT_CMD[@]} -gt 0 ]] || die "$name.sh defines no AGENT_CMD"
 }
 
+# --------------------------------------------------------------- vm (macOS) --
+# On macOS every podman call is remote: the client talks to podman inside a Linux
+# VM. Three of that arrangement's failure modes are silent or misleading, so
+# check them once, up front, rather than debugging them through a confusing
+# error later. No-op on Linux.
+ensure_machine() {
+  [[ $HOST == darwin ]] || return 0
+
+  local state
+  state="$(podman machine inspect --format '{{.State}}' 2>/dev/null || true)"
+  [[ "$state" == running ]] \
+    || die "podman machine is not running (state: ${state:-none}) — 'podman machine start'"
+
+  # --memory 8g on the agent container is a cgroup limit inside the VM. Ask for
+  # more than the VM has and the limit is a lie the kernel cannot honour: the
+  # agent gets OOM-killed mid-session instead of being told no.
+  local vm_mb
+  vm_mb="$(podman machine inspect --format '{{.Resources.Memory}}' 2>/dev/null || true)"
+  if [[ "$vm_mb" =~ ^[0-9]+$ ]]; then
+    (( vm_mb >= 10240 )) \
+      || die "podman machine has ${vm_mb}MiB but the agent asks for 8g — 'podman machine set --memory 12288'"
+  else
+    warn "could not read podman machine memory; ensure it exceeds 8g"
+  fi
+}
+
+# A path outside the VM's virtiofs shares does not fail loudly — podman creates
+# the mount point and it comes up EMPTY, so the agent runs against nothing and
+# looks like it succeeded. Refuse instead.
+#
+# This asks the VM whether the path is there rather than reading the machine's
+# share list, because that list is not exposed: `podman machine inspect` reports
+# Mounts as null on podman 6 and the field is not even templatable. Testing the
+# property beats parsing an internal config layout that can move between
+# releases. One ssh round-trip, ~0.2s, both paths in a single call.
+assert_vm_shared() {
+  [[ $HOST == darwin ]] || return 0
+  local p
+  for p in "$@"; do
+    # These are interpolated into a remote shell command. Paths this odd are not
+    # worth supporting; refusing is cheaper than getting the quoting wrong.
+    case $p in *"'"*) die "path contains a single quote, which this tool will not pass to the VM: $p" ;; esac
+  done
+
+  local cmd='' missing
+  for p in "$@"; do cmd+="test -d '$p' || echo '$p'; "; done
+  missing="$(podman machine ssh "$cmd" 2>/dev/null || true)"
+  [[ -z "${missing//[[:space:]]/}" ]] && return 0
+
+  die "not visible inside the podman machine VM, so it would mount EMPTY:
+$(printf '%s\n' "$missing" | sed 's/^/    /')
+  The VM only sees paths shared into it at init. Either move the project under a
+  shared path, or re-create the machine:
+    podman machine rm && podman machine init --cpus 6 --memory 12288 --disk-size 100 \\
+      --volume \"\$HOME/git:\$HOME/git\" --volume \"$STATE_ROOT:$STATE_ROOT\""
+}
+
 # ------------------------------------------------------------------ podman ---
 build() {
+  ensure_machine
   render_allowlist
   log "building $PROXY_IMAGE"
   podman build -t "$PROXY_IMAGE" "$HERE/proxy"
@@ -101,8 +200,8 @@ ensure_proxy() {
       --network "$EGRESS_NET" \
       --security-opt no-new-privileges \
       --cap-drop ALL --cap-add SETUID --cap-add SETGID \
-      -v "$HERE/proxy/squid.conf:/etc/squid/squid.conf:ro,Z" \
-      -v "$HERE/proxy/allowlist.generated.txt:/etc/squid/allowlist.txt:ro,Z" \
+      -v "$HERE/proxy/squid.conf:/etc/squid/squid.conf$ROZ" \
+      -v "$HERE/proxy/allowlist.generated.txt:/etc/squid/allowlist.txt$ROZ" \
       "$PROXY_IMAGE" >/dev/null
     sleep 1
   fi
@@ -135,6 +234,16 @@ ensure_proxy() {
 ensure_notifier() {
   NOTIFY_ENABLED=0
   [[ "${SBX_NOTIFY:-1}" == 0 ]] && return 0
+
+  # macOS: not ported, and it must say so rather than half-work. The FIFO cannot
+  # cross virtiofs as a pipe, the listener needs bash 4 and flock (macOS has
+  # neither), and an osascript renderer would reintroduce the string-injection
+  # surface the argv-based one was built to avoid. Returning here also dodges a
+  # nastier failure: setsid does not exist on macOS, so the `|| true` below would
+  # swallow it and leave NOTIFY_ENABLED=1 — advertising a channel to the host
+  # with no listener on the other end. See README "Known gaps".
+  [[ $HOST == darwin ]] && return 0
+
   command -v notify-send >/dev/null 2>&1 \
     || { warn "no notify-send on host — notifications disabled"; return 0; }
 
@@ -148,7 +257,7 @@ ensure_notifier() {
 run_agent() {
   local agent="$1" project="$2"
   [[ -d "$project" ]] || die "not a directory: $project"
-  project="$(realpath "$project")"
+  project="$(sbx_realpath "$project")"
 
   # Human-readable basename + a hash of the FULL realpath. The basename alone
   # collides (~/code/foo and ~/work/foo both -> "foo"), which would silently
@@ -156,7 +265,7 @@ run_agent() {
   # thing the per-project split is supposed to prevent. The hash disambiguates.
   local slug base hash
   base="$(basename "$project" | tr -cd '[:alnum:]._-')"
-  hash="$(printf '%s' "$project" | sha256sum | head -c 12)"
+  hash="$(printf '%s' "$project" | sbx_sha256 | head -c 12)"
   slug="${base:-project}-$hash"
 
   # State is per (agent, project). Two agents don't share sessions or tokens,
@@ -165,17 +274,20 @@ run_agent() {
   export AGENT_STATE_ROOT
   mkdir -p "$AGENT_STATE_ROOT"
 
+  # Both of these are bind-mounted below, so both must be visible inside the VM.
+  assert_vm_shared "$project" "$STATE_ROOT"
+
   local mounts=()
   for d in "${AGENT_STATE_DIRS[@]:-}"; do
     [[ -z "$d" ]] && continue
     mkdir -p "$AGENT_STATE_ROOT/$d"
-    mounts+=(-v "$AGENT_STATE_ROOT/$d:/home/agent/$d:Z")
+    mounts+=(-v "$AGENT_STATE_ROOT/$d:/home/agent/$d$Z")
   done
   for f in "${AGENT_STATE_FILES[@]:-}"; do
     [[ -z "$f" ]] && continue
     mkdir -p "$(dirname "$AGENT_STATE_ROOT/$f")"
     [[ -f "$AGENT_STATE_ROOT/$f" ]] || echo '{}' > "$AGENT_STATE_ROOT/$f"
-    mounts+=(-v "$AGENT_STATE_ROOT/$f:/home/agent/$f:Z")
+    mounts+=(-v "$AGENT_STATE_ROOT/$f:/home/agent/$f$Z")
   done
 
   local envs=()
@@ -192,8 +304,8 @@ run_agent() {
   # invoke. Still review/push from a fresh clone — see README "The credential rule".
   local git_guard=()
   if [[ -d "$project/.git" ]]; then
-    [[ -e "$project/.git/hooks" ]]  && git_guard+=(-v "$project/.git/hooks:/work/.git/hooks:ro,Z")
-    [[ -f "$project/.git/config" ]] && git_guard+=(-v "$project/.git/config:/work/.git/config:ro,Z")
+    [[ -e "$project/.git/hooks" ]]  && git_guard+=(-v "$project/.git/hooks:/work/.git/hooks$ROZ")
+    [[ -f "$project/.git/config" ]] && git_guard+=(-v "$project/.git/config:/work/.git/config$ROZ")
   fi
 
   # The notification channel: one FIFO, bind-mounted as a single file. This is
@@ -226,31 +338,40 @@ run_agent() {
   log "network: $INTERNAL_NET (egress only via $PROXY_NAME)"
   (( NOTIFY_ENABLED )) && log "notify:  /run/sandbox-notify -> host desktop"
 
-  exec podman run --rm -it \
-    --name "sbx-$agent-$slug-$$" \
-    --hostname sandbox \
-    --network "$INTERNAL_NET" \
-    --userns keep-id:uid=1000,gid=1000 \
-    --security-opt no-new-privileges \
-    --cap-drop ALL \
-    --pids-limit 2048 \
-    --memory 8g \
-    -e "HTTP_PROXY=http://${PROXY_NAME}:3128" \
-    -e "HTTPS_PROXY=http://${PROXY_NAME}:3128" \
-    -e "http_proxy=http://${PROXY_NAME}:3128" \
-    -e "https_proxy=http://${PROXY_NAME}:3128" \
-    -e "NO_PROXY=localhost,127.0.0.1" \
-    -e "GIT_AUTHOR_NAME=$agent (sandboxed)" \
-    -e "GIT_AUTHOR_EMAIL=$agent@sandbox.local" \
-    -e "GIT_COMMITTER_NAME=$agent (sandboxed)" \
-    -e "GIT_COMMITTER_EMAIL=$agent@sandbox.local" \
-    "${envs[@]}" \
-    "${mounts[@]}" \
-    -v "$project:/work:Z" \
-    "${git_guard[@]}" \
-    "${notify_mount[@]}" \
-    -w /work \
-    "$IMAGE" "${AGENT_CMD[@]}"
+  # One array, expanded once, and never empty — because bash 3.2 (which is what
+  # /bin/bash is on macOS) cannot expand an empty array to zero words under
+  # set -u. "${arr[@]}" is an unbound-variable error there, and BOTH the usual
+  # workarounds — "${arr[@]:-}" and "${arr[@]+"${arr[@]}"}" — yield one EMPTY
+  # ARGUMENT rather than none, which podman then rejects. Appending only
+  # non-empty arrays into an always-populated one sidesteps all of it. Keep the
+  # append order: git_guard mounts are nested inside /work.
+  local run=(run --rm -it
+    --name "sbx-$agent-$slug-$$"
+    --hostname sandbox
+    --network "$INTERNAL_NET"
+    --userns keep-id:uid=1000,gid=1000
+    --security-opt no-new-privileges
+    --cap-drop ALL
+    --pids-limit 2048
+    --memory 8g
+    -e "HTTP_PROXY=http://${PROXY_NAME}:3128"
+    -e "HTTPS_PROXY=http://${PROXY_NAME}:3128"
+    -e "http_proxy=http://${PROXY_NAME}:3128"
+    -e "https_proxy=http://${PROXY_NAME}:3128"
+    -e "NO_PROXY=localhost,127.0.0.1"
+    -e "GIT_AUTHOR_NAME=$agent (sandboxed)"
+    -e "GIT_AUTHOR_EMAIL=$agent@sandbox.local"
+    -e "GIT_COMMITTER_NAME=$agent (sandboxed)"
+    -e "GIT_COMMITTER_EMAIL=$agent@sandbox.local"
+  )
+  if (( ${#envs[@]} ));         then run+=("${envs[@]}");         fi
+  if (( ${#mounts[@]} ));       then run+=("${mounts[@]}");       fi
+  run+=(-v "$project:/work$Z")
+  if (( ${#git_guard[@]} ));    then run+=("${git_guard[@]}");    fi
+  if (( ${#notify_mount[@]} )); then run+=("${notify_mount[@]}"); fi
+  run+=(-w /work "$IMAGE" "${AGENT_CMD[@]}")
+
+  exec podman "${run[@]}"
 }
 
 down() {
@@ -267,19 +388,19 @@ down() {
 
 # ------------------------------------------------------------------- main ----
 case "${1:-}" in
-  ""|-h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+  ""|-h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed -E 's/^# ?//'; exit 0 ;;
   --build)  build; exit 0 ;;
   --down)   down;  exit 0 ;;
   --agents) list_agents; exit 0 ;;
   --logs)   exec podman logs -f "$PROXY_NAME" ;;
   shell)
-    ensure_networks; ensure_proxy; ensure_notifier
+    ensure_machine; ensure_networks; ensure_proxy; ensure_notifier
     AGENT_CMD=(/bin/bash); AGENT_STATE_DIRS=(); AGENT_STATE_FILES=(); AGENT_ENV=()
     run_agent shell "${2:-$PWD}"
     ;;
   *)
     load_agent "$1"
-    ensure_networks; ensure_proxy; ensure_notifier
+    ensure_machine; ensure_networks; ensure_proxy; ensure_notifier
     run_agent "$1" "${2:-$PWD}"
     ;;
 esac

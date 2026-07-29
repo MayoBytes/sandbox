@@ -19,7 +19,10 @@ whether it preserves that boundary.
 - `agents/<name>.sh` — per-agent profile, sourced by `sandbox`. Defines
   `AGENT_CMD`, `AGENT_STATE_DIRS`, `AGENT_STATE_FILES`, `AGENT_ENV`, and an
   optional `agent_seed_project` function. Adding an agent = adding one file here.
-- `Containerfile` — the agent image (Arch base). Pinned tool installs.
+- `Containerfile` — the agent image (Fedora base). Pinned tool installs. Fedora
+  and not Arch for exactly one reason: it publishes an official multi-arch
+  manifest, and the official `archlinux` image is amd64-only. One base for every
+  host means one reset point (invariant 7); per-arch bases would mean two.
 - `proxy/` — the Squid image, its `squid.conf`, and `allowlist.d/*.txt`.
 - `proxy/allowlist.generated.txt` — **generated**, git-ignored. Never edit by
   hand; it's rebuilt from `allowlist.d/*.txt` by `render_allowlist()` in
@@ -59,7 +62,13 @@ must be called out explicitly, never made silently.
    agent can still commit.
 6. **Hardening flags on `podman run` stay on**: `--userns keep-id`,
    `--security-opt no-new-privileges`, `--cap-drop ALL` (the proxy adds back
-   only SETUID/SETGID), `--pids-limit`, `--memory`.
+   only SETUID/SETGID), `--pids-limit`, `--memory`. All of these are enforced by
+   the Linux kernel, which on macOS is the one inside the podman machine VM — so
+   they hold there unchanged. Two Darwin caveats, neither a reason to drop a flag:
+   `keep-id` maps the *VM's* user rather than your macOS uid (dropping it would
+   map the container user to VM-root, which is strictly worse), and `--memory 8g`
+   is a cgroup limit the VM must actually have the RAM to honour — that's what
+   `ensure_machine` checks.
 7. **The image is the reset point.** Auto-update is disabled for every tool
    (`DISABLE_UPDATES=1`, opencode `autoupdate: false`, crush pinned). A change
    that lets a tool mutate itself at runtime breaks "rebuild = known state".
@@ -70,12 +79,26 @@ must be called out explicitly, never made silently.
   existing `.git` guard and network comments. Match that. A non-obvious line
   gets a reason.
 - **Bash.** `sandbox` runs `set -euo pipefail`. Keep it. Quote expansions;
-  guard array expansions with `${arr[@]:-}`.
+  guard array expansions with `${arr[@]:-}`. **`sandbox` must stay bash-3.2
+  clean** — that's what `/bin/bash` is on macOS, and `#!/usr/bin/env bash` finds
+  it first. No associative arrays, no `${var^^}`, no `mapfile`. `notify/listener`
+  is exempt; it's Linux-only and already uses `declare -A`. Check with
+  `/bin/bash -n sandbox` on a Mac.
+- **No GNU-only host tools in `sandbox`.** BSD userland is the constraint, and
+  the failure mode is nasty: under `set -e` a missing `sha256sum` or `realpath`
+  aborts the run. Both have shims (`sbx_sha256`, `sbx_realpath`); note
+  `sbx_sha256` must keep producing the same digest as `sha256sum` or every
+  project's state dir silently re-keys and orphans its auth tokens.
 - **Adding an agent.** Drop `agents/<name>.sh`, add its domains as
   `proxy/allowlist.d/20-<name>.txt`, add its install to `Containerfile`. Prefer
   the tool's native/pinned installer over one that self-updates.
-- **This repo is Arch- and single-user-tailored on purpose.** Don't generalize
-  it (other distros, multi-user) unless asked — see README framing.
+- **This repo is single-user-tailored on purpose.** Don't generalize it
+  (multi-user, other container runtimes) unless asked — see README framing.
+- **Two host platforms: Linux and macOS.** Every platform difference lives in the
+  one `host` block near the top of `sandbox` (`$HOST`, `$Z`/`$ROZ`,
+  `sbx_realpath`, `sbx_sha256`, `NOTIFY_DIR`). Nothing below it branches on the
+  OS. If you need a new difference, add a shim up there — a second
+  `case $HOST` scattered further down is how this rots.
 
 ## Build / test
 
@@ -90,3 +113,9 @@ changes to the boundary:
 
 Test #1 in that section (no route out, no DNS resolution for a non-allowlisted
 host) is the regression check. If a change touches networking, run it.
+
+A change to the `Containerfile` or to anything in the `host` block has to be
+verified on **both** platforms — they share one image and one script, so a change
+that fixes one can break the other silently. On macOS `podman machine start`
+first; `./sandbox` will refuse with a clear error if the VM is down, undersized,
+or doesn't share the project path.

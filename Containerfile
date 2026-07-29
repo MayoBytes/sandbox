@@ -1,5 +1,12 @@
 # Agent sandbox image — agent-agnostic base + pinned agent installs.
-FROM docker.io/library/archlinux:base-devel
+#
+# Fedora, not Arch, for one reason: it publishes an official multi-arch manifest.
+# The official archlinux image is amd64-only, so on an arm64 host the only
+# choices were emulation (slow, and bubblewrap + the seccomp helper under
+# qemu-user is a gamble) or an unofficial single-maintainer ARM rebuild — a
+# supply-chain trade not worth making underneath a security boundary. One base
+# for every host keeps ONE reset point, which is the invariant that matters.
+FROM registry.fedoraproject.org/fedora:44
 
 # Pin everything. The image IS your reset point; an agent that can update
 # itself at runtime means "rebuild" no longer guarantees a known state.
@@ -7,19 +14,22 @@ ARG CLAUDE_VERSION=stable
 ARG OPENCODE_VERSION=latest
 ARG CRUSH_VERSION=latest
 
-RUN pacman -Syu --noconfirm \
+# install_weak_deps=False: recommends are not part of a reset point you can
+# reason about. shadow-utils because the Fedora base image has no useradd.
+RUN dnf -y --setopt=install_weak_deps=False install \
       git \
       nodejs npm \
-      python python-pip uv \
-      go \
-      rust \
-      ripgrep fd jq \
+      python3 python3-pip uv \
+      golang \
+      rust cargo \
+      ripgrep fd-find jq \
       curl wget \
-      less vim \
+      less vim-enhanced \
       ca-certificates \
       bubblewrap socat \
-  && pacman -Scc --noconfirm \
-  && rm -rf /var/cache/pacman/pkg/*
+      shadow-utils \
+  && dnf clean all \
+  && rm -rf /var/cache/dnf/*
 
 # Notifications go out over a pipe, not D-Bus — deliberately NO libnotify here.
 # Real notify-send needs the host session bus, which is a desktop control plane
