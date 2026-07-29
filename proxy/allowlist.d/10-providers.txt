@@ -4,6 +4,7 @@
 api.z.ai
 models.dev
 api.anthropic.com
+platform.claude.com
 # api.openai.com
 # openrouter.ai
 # generativelanguage.googleapis.com
