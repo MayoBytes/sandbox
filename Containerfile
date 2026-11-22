@@ -6,7 +6,7 @@
 # qemu-user is a gamble) or an unofficial single-maintainer ARM rebuild — a
 # supply-chain trade not worth making underneath a security boundary. One base
 # for every host keeps ONE reset point, which is the invariant that matters.
-FROM registry.fedoraproject.org/fedora:44
+FROM registry.fedoraproject.org/fedora:45
 
 # Pin everything. The image IS your reset point; an agent that can update
 # itself at runtime means "rebuild" no longer guarantees a known state.

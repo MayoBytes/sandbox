@@ -3,10 +3,12 @@
 # and allowlist.txt are bind-mounted read-only at run time (see ./sandbox
 # ensure_proxy), so this image is just squid + a place to run it.
 #
-# Alpine, not archlinux like the agent image: the proxy sits on the boundary,
-# so a minimal base with a smaller attack surface is the right call, and the
-# alpine package sets up the `squid` user/dirs deterministically.
-FROM docker.io/library/alpine:3.20
+# Alpine, not Fedora like the agent image: the proxy sits on the boundary, so a
+# minimal base with a smaller attack surface is the right call, and the alpine
+# package sets up the `squid` user/dirs deterministically. Keep it on a
+# supported branch (each gets ~2 years) — an EOL base here means unpatched
+# squid on the one host that touches the internet.
+FROM docker.io/library/alpine:3.24
 
 RUN apk add --no-cache squid ca-certificates
 
